@@ -1,0 +1,233 @@
+#!/bin/sh
+
+# Copyright (c) 2010, 2011 George Danchev <danchev@spnet.net>
+# Copyright (c) 2010, 2011 Thomas Schmitt <scdbackup@gmx.net>
+# Copyright (c) 2010, 2011 Steve McIntyre <steve@einval.com>
+# This script is distributed according to the terms of the GNU GPL v2.
+# This should be better rewritten in C at some future point. Ref: pwd code.
+
+# Create a list of checksums encoded in hexadecimal format and print to standard output
+
+# Format Description
+# A line in the emerging file is to be composed as follows:
+#
+# The MD5 checksum of the file content must be encoded in 32 hex digits
+# [0-9afAF], or
+# The SHA256 checksum of the file content must be encoded in 64 hex digits
+# [0-9afAF]
+#
+# Next come two blanks.
+#
+# The byte size of the file content must be encoded in 12 decimal digits
+# or blanks.
+#
+# Next come two blanks.
+#
+# The rest of the line up to the newline character is a semi-literal file
+# address. Its basename has to be the same as the basename of the data file
+# when it is used as one of the input files for the jigdo file generator.
+
+# The semi-literal address and the address mapping define what will be
+# listed as file address in the jigdo file.
+# The address may bear at its start a literal text that shall be recognized by
+# the address mapping (e.g. -jigdo-map) of the jigdo file generator.
+# The rest of the address must be usable as file address in both situations:
+# When the jigdo file gets generated, and when the jigdo file gets read
+# to inflate the template file into the original payload image.
+# The address mappings at both occasions can be used to adapt to a change
+# of the absolute location of the listed files.
+# Between both mappings, the parent directory is represented by a symbolic
+# text, like "Debian:".
+
+# A simple strategy to cope with this is to write absolute paths into the
+# output checksum file, and to use matching absolute paths in the -jigdo-map
+# directives. Keep in mind that mapping is purely literal. Symbolic links
+# are neither resolved nor can they confuse the mapping.
+
+set -e
+
+SELF=jigdo-gen-checksum-list
+VER=0.2
+
+OPT_ABSOLUTE=1
+
+usage() {
+    cat << USAGE
+usage: $SELF [option] DIR FILE ...
+ -a, --make-absolute    make absolute paths, avoiding any symlinks (default)
+ -l, --keep-literal     leave paths untouched, literally as supplied
+ -v, --version          print version
+ -h, --help             print help
+ -e, --examples         print examples
+ -c, --checksum-algo	speciify checksum algorithm.
+                        Valid options are md5 (default) and sha256
+USAGE
+}
+
+examples() {
+    cat << EXAMPLES
+examples:
+ $SELF datadir datafile
+ $SELF --keep-literal datadir datafile
+ find . -type f | xargs $SELF
+ find . -exec $SELF '{}' ';'
+EXAMPLES
+}
+
+md5list_gnu() {
+    item="$1"
+    if [ $OPT_ABSOLUTE -eq 1 ] ; then
+        dn=`dirname "$item"`  # dirname
+        fn=`basename "$item"` # filename
+        od=`pwd -P`           # old dir
+        cd "$dn" || exit 1
+        item=`pwd -P`/"$fn"   # absolute physical file path, avoiding all symlinks
+        cd "$od" || exit 1
+    fi
+    MD5=`md5sum "$item" | awk '{print $1}'`
+    SIZ=`/usr/bin/stat -c %s "$item"`
+    printf '%32s  %12s  %s\n' "$MD5" "$SIZ" "$item"
+}
+
+sha256list_gnu() {
+    item="$1"
+    if [ $OPT_ABSOLUTE -eq 1 ] ; then
+        dn=`dirname "$item"`  # dirname
+        fn=`basename "$item"` # filename
+        od=`pwd -P`           # old dir
+        cd "$dn" || exit 1
+        item=`pwd -P`/"$fn"   # absolute physical file path, avoiding all symlinks
+        cd "$od" || exit 1
+    fi
+    SHA256=`sha256sum "$item" | awk '{print $1}'`
+    SIZ=`/usr/bin/stat -c %s "$item"`
+    printf '%64s  %12s  %s\n' "$SHA256" "$SIZ" "$item"
+}
+
+md5list_freebsd() {
+    item="$1"
+    if [ $OPT_ABSOLUTE -eq 1 ] ; then
+        dn=`dirname "$item"`  # dirname
+        fn=`basename "$item"` # filename
+        od=`pwd -P`           # old dir
+        cd "$dn" || exit 1
+        item=`pwd -P`/"$fn"   # absolute physical file path, avoiding all symlinks
+        cd "$od" || exit 1
+    fi
+    MD5=`md5 -q "$item"`
+    SIZ=`/usr/bin/stat -f %z "$item"`
+    printf '%32s  %12s  %s\n' "$MD5" "$SIZ" "$item"
+}
+
+sha256list_freebsd() {
+    item="$1"
+    if [ $OPT_ABSOLUTE -eq 1 ] ; then
+        dn=`dirname "$item"`  # dirname
+        fn=`basename "$item"` # filename
+        od=`pwd -P`           # old dir
+        cd "$dn" || exit 1
+        item=`pwd -P`/"$fn"   # absolute physical file path, avoiding all symlinks
+        cd "$od" || exit 1
+    fi
+    SHA256=`sha256 -q "$item"`
+    SIZ=`/usr/bin/stat -f %z "$item"`
+    printf '%64s  %12s  %s\n' "$SHA256" "$SIZ" "$item"
+}
+
+walkdir() {
+    DR="$1"
+    for item in `find "$DR" -type f` ; do
+        $CHECKSUM_LIST "$item"
+    done
+}
+
+
+# main()
+if [ "$1" = "" ] ; then
+    usage
+    exit 1
+fi
+
+OPT_ALGO="md5"
+
+case "$1" in
+    --make-absolute|-a)
+        OPT_ABSOLUTE=1;
+        shift;
+        ;;
+    --keep-literal|-l)
+        OPT_ABSOLUTE=0;
+        shift;
+        ;;
+    --checksum-algo|-c)
+        OPT_ALGO=$2;
+        shift;
+        shift;
+        ;;
+    --version|-v)
+        printf '%s %s\n' "$SELF" "$VER"
+        exit 0
+        ;;
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    --examples|-e)
+        examples
+        exit 0
+#   *)
+#       usage
+#       exit 1
+#       ;;
+esac
+
+if [ "$OPT_ALGO" != "md5" ] && [ "$OPT_ALGO" != "sha256" ] ; then
+    echo "Unrecognised checksum algorithm \"$OPT_ALGO\""
+    echo "Allowed values are \"md5\" and \"sha256\"";
+    exit 1
+fi
+
+SYSTEM=`uname -s`
+case $SYSTEM in
+    Linux|GNU/kFreeBSD)
+	case $OPT_ALGO in
+	    md5)
+		CHECKSUM_LIST=md5list_gnu;;
+	    sha256)
+		CHECKSUM_LIST=sha256list_gnu;;
+	esac;;
+    FreeBSD)
+	case $OPT_ALGO in
+	    md5)
+		CHECKSUM_LIST=md5list_freebsd;;
+	    sha256)
+		CHECKSUM_LIST=sha256list_freebsd;;
+	esac;;
+    *)
+        echo "System type $SYSTEM unsupported"
+        echo "Abort."
+        exit 1;;
+esac
+
+for i in "$@" ; do
+    if [ -d "$i" ] ; then
+        DR="$i"
+        if [ $OPT_ABSOLUTE -eq 1 ] ; then
+            od=`pwd -P`           # old dir
+            cd "$DR" || exit 1
+            DR=`pwd -P`           # absolute physical dir path, avoiding all symlinks
+            cd "$od" || exit 1
+        fi
+        walkdir "$DR"
+    elif [ -f "$i" ] ; then
+        FL="$i"
+        $CHECKSUM_LIST "$FL"
+    else
+        usage
+        exit 1
+    fi;
+
+done
+
+exit 0
+

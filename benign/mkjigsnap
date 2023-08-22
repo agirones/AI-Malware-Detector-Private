@@ -1,0 +1,553 @@
+#!/usr/bin/perl -w
+#
+# mkjigsnap
+#
+# (c) 2004-2019 Steve McIntyre <steve@einval.com>
+#
+# Server-side wrapper; run this on a machine with a mirror to set up
+# the snapshots for jigit / jigdo downloading
+#
+# GPL v2 - see COPYING 
+#
+# This script can be run in two modes:
+#
+# 1. To build a jigit .conf file for a single jigdo file:
+#    add the "-n" option with a CD name on the command line
+#    and only specify a single jigdo to work with using "-j".
+#
+# 2. To build a snapshot tree for (potentially multiple) jigdo files:
+#    do *not* specify the "-n" option, and list as many jigdo files as
+#    desired, either on the command line using multiple "-j <jigdo>" options
+#    or (better) via a file listing them with the "-J" option.
+#
+# Some things needed:
+#   (single-jigdo mode only) the CD name of the jigit
+#   (single-jigdo mode only) the output location; where the jigdo, template
+#      file and snapshot will be written
+#   (single-jigdo mode only) the locations of the input jigdo and template
+#      files
+#   the location of the mirror
+#   the keyword(s) to look for (e.g. Debian)
+#   the snapshot dirname (e.g. today's date)
+#
+# Example #1: (single-jigdo mode, used for Ubuntu jigit generation)
+#
+#   mkjigsnap -o /tmp/mjs-test -n mjs-test -m /tmp/mirror \
+#        -j ~/jigdo/update/debian-update-3.0r2.01-i386.jigdo \
+#        -t ~/jigdo/update/debian-update-3.0r2.01-i386.template \
+#        -k Debian -k Non-US
+#        -d 20041017
+#
+#   (This creates a single jigit conf file using the supplied jigdo/template
+#    file pair, looking for jigdo references to files in the "Debian" and
+#    "Non-US" areas. Output the files into /tmp/mjs-test and call them
+#    "mjs-test.<ext>", creating a snapshot of the needed files in
+#    /tmp/mjs-test/20041017 by linking files from /tmp/mirror as needed.)
+#
+# Example #2: (multi-jigdo mode, as run to keep
+#              http://us.cdimage.debian.org/cdimage/snapshot/ up to date)
+#
+# mkjigsnap -m /org/ftp/debian -J ~/jigdo.list \
+#      -k Debian \
+#      -d /org/jigdo-area/snapshot/Debian \
+#      -f ~/mkjigsnap-failed.log \
+#      -i ~/mkjigsnap-ignore.list
+#
+#   (This reads in all the jigdo files listed in ~/jigdo.list, building a
+#    list of all the files referenced in the "Debian" area. It will then
+#    attempt to build a snapshot tree of all those files under
+#    /org/jigdo-area/snapshot/Debian by linking from /org/ftp/debian. Any
+#    files that are missing will be listed into the output "missing" file
+#    ~/mkjigsnap-failed.log for later checking, UNLESS they are already listed
+#    in the "ignore" file ~/mkjigsnap-ignore.list.)
+#      
+
+use strict;
+use Getopt::Long;
+use File::Basename;
+use File::Find;
+use File::Copy;
+use Compress::Zlib;
+Getopt::Long::Configure ('no_ignore_case');
+Getopt::Long::Configure ('no_auto_abbrev');
+
+my $mode = "multi";
+my $dryrun = 0;
+my $verbose = 0;
+my $startdate = `date -u`;
+my ($jlistdonedate, $parsedonedate, $snapdonedate);
+my @jigdos;
+my $single_jigdo;
+my @keywords;
+my @mirrors;
+my ($dirname, $failedfile, $ignorefile, $jigdolist, $mirror, $cdname,
+    $outdir, $tempdir, $template, $check_checksums, $checksum_out, $backref_file);
+my $result;
+my $num_jigdos = 0;
+my $num_unsorted = 0;
+my $num_unique = 0;
+my @failed_files;
+my @ck_failed_files;
+my $old_deleted = 0;
+my %ignored_fails;
+my %file_list;
+my %ref;
+my %jigdo_backref;
+
+GetOptions("b=s" => \$backref_file,
+           "c"   => \$check_checksums,
+           "C=s" => \$checksum_out,
+           "d=s" => \$dirname,
+           "f=s" => \$failedfile,
+           "i=s" => \$ignorefile,
+           "J=s" => \$jigdolist,
+           "j=s" => \@jigdos,
+           "k=s" => \@keywords,
+           "m=s" => \@mirrors,
+           "N"   => \$dryrun,
+           "n=s" => \$cdname,
+           "o=s" => \$outdir,
+           "T=s" => \$tempdir,
+           "t=s" => \$template,
+           "v"   => \$verbose)
+    or die "Error in command line arguments, bailing out\n";
+
+# Sanity-check arguments
+if (!defined ($dirname)) {
+    die "You must specify the snapshot directory name!\n";
+}
+if (!@keywords) {
+    die "You must specify the keywords to match!\n";
+}
+if (!@mirrors) {
+    die "You must specify the location(s) of the mirror(s)!\n";
+}
+if (@jigdos) {
+    $num_jigdos += scalar(@jigdos);
+}
+if (defined($jigdolist)) {
+    $num_jigdos += `wc -w < $jigdolist`;
+}
+if ($num_jigdos == 0) {
+    die "No jigdo file(s) specified!\n";
+}
+if (defined($cdname)) {
+    $mode = "single";
+}
+
+if ($mode eq "single") {
+    if (!defined($cdname)) {
+        die "You must specify the output name for the jigit conf!\n";
+    }
+    if (!defined($outdir)) {
+        die "You must specify where to set up the snapshot!\n";
+    }
+    if (!defined($template)) {
+        die "You must specify the template file!\n";
+    }
+    if ($num_jigdos != 1) {
+        die "More than one jigdo file specified ($num_jigdos) in single-jigdo mode!\n";
+    }
+    # In single-jigdo mode, the snapshot directory is relative to the
+    # output dir
+    $dirname="$outdir/$dirname";
+    # And store the path to the jigdo file for later use
+    $single_jigdo = $jigdos[0];
+} else {
+    if (defined($cdname)) {
+        die "Output name is meaningless for multi-jigdo mode!\n";
+    }
+    if (defined($outdir)) {
+        die "Output dir is meaningless for multi-jigdo mode!\n";
+    }
+    if (defined($template)) {
+        die "Template file name is meaningless for multi-jigdo mode!\n";
+    }
+}
+
+# Make a dir tree
+sub mkdirs {
+    my $input = shift;
+    my $dir;
+    my @components;
+    my $need_slash = 0;
+
+    if (! -d $input) {
+        if ($verbose) {
+            print "mkdirs($input)\n";
+        }
+        if (!$dryrun) {
+            @components = split /\//,$input;
+            foreach my $component (@components) {
+                if ($need_slash) {
+                    $dir = join ("/", $dir, $component);
+                } else {
+                    $dir = $component;
+                    $need_slash = 1;
+                }
+                mkdir $dir;
+            }
+        } else {
+            print "DRYRUN: not making directory tree $input\n";
+        }
+    }
+}
+
+sub delete_redundant {
+    my $link;
+
+    if (-f) {
+        $link = $file_list{$File::Find::name};
+        if (!defined($link)) {
+            if ($verbose) {
+                print "delete_redundant($File::Find::name)\n";
+            }
+            if (!$dryrun) {
+                unlink($File::Find::name);
+            } else  {
+                print "DRYRUN: not deleting $File::Find::name\n";
+            }
+            $old_deleted++;
+            if ( !($old_deleted % 1000) ) {
+                print "$old_deleted\n";
+            }
+        }
+    }
+}
+
+sub parse_ignore_file {
+    my $inputfile = shift;
+    my $num_ignored_loaded = 0;
+    open(INLIST, "$inputfile") or return;
+    while (defined (my $pkg = <INLIST>)) {
+        chomp $pkg;
+        $ignored_fails{$pkg}++;
+        $num_ignored_loaded++;
+    }
+    print "parse_ignore_file: loaded $num_ignored_loaded entries from file $inputfile\n";
+}
+
+# Iff we have a checksum of the right type, calculate the checksum of
+# the file on disk and validate
+sub validate_checksum($$$) {
+    my $file = shift;
+    my $full_path = shift;
+    my $type = shift;
+    my $jigsum;
+    my $checksum = "";
+
+    if (! exists $ref{$file}{$type}) {
+	return 0; # Nothing to compare, so we're good!
+    }
+
+    # else
+    if ($type eq "md5") {
+	$jigsum= `jigsum $full_path 2>/dev/null`;
+	if ($jigsum =~ m/^(.{22}) /) {
+	    $checksum = $1;
+	}
+    } elsif ($type eq "sha256") {
+	$jigsum= `jigsum-sha256 $full_path 2>/dev/null`;
+	if ($jigsum =~ m/^(.{43}) /) {
+	    $checksum = $1;
+	}
+    }
+
+    if (length($checksum) < 2) {
+	# Didn't find a checksum in the jigsum output, so failed
+	return -2;
+    }
+
+    # else
+    if (!($ref{$file}{$type} =~ m/\Q$checksum\E/)) {
+	return -1;
+    }
+
+    # else
+    return 0;
+}
+
+sub generate_snapshot_tree () {
+    my $done = 0;
+    my $failed = 0;
+    my $ignored = 0;
+    my $ck_failed = 0;
+
+    $| = 1;
+
+    # Sorting is important here for performance, to help with
+    # directory lookups
+    foreach $_ (sort (keys %ref)) {
+        my $outfile = $dirname . "/" . $_;
+
+        $file_list{$outfile}++;
+        if ($verbose) {
+            print "file_list hash updated for $outfile\n";
+        }
+        if (! -e $outfile) {
+            my $dir = dirname($_);
+            my $filename = basename($_);
+            my $link;
+            my $link_ok = 0;
+            my $infile;
+
+            mkdirs($dirname . "/" . $dir);
+
+            foreach my $mirror (@mirrors) {
+                $infile = $mirror . "/" . $_;
+                if (-l $infile) {
+                    $link = readlink($infile);
+                    if ($link =~ m#^/#) {
+                        $infile = $link;
+                    } else {
+                        $infile = dirname($infile) . "/" . $link;
+                    }
+                }
+                if ($verbose) {
+                    print "look for $_:\n";
+                }             
+                $outfile = $dirname . "/" . $_;
+                if (!$dryrun) {
+                    if ($verbose) {
+                        print "  try $infile\n";
+                    }
+                    if (link ($infile, $outfile)) {
+                        $link_ok = 1;
+                        last;
+                    }
+                } else {
+                    print "DRYRUN: not linking $infile to $outfile\n";
+                    $link_ok = 1;
+                    last;
+                }
+                $infile = $mirror . "/" . $filename;
+                if ($verbose) {
+                    print "  fallback: try $infile\n";
+                }
+                if (!$dryrun) {
+                    if (link ($infile, $outfile)) {
+                        $link_ok = 1;
+                        last;
+                    }
+                } else {
+                    print "DRYRUN: not linking $infile to $outfile\n";
+                    $link_ok = 1;
+                    last;
+                }
+            }
+            if ($link_ok == 0) {
+                if ($ignored_fails{$_}) {
+                    $ignored++;
+                } else {
+                    if (!defined($failedfile)) {
+                        # No logfile, print to stdout then
+                        print "\nFailed to create link $outfile\n";
+                    }
+                    $failed++;
+                    push (@failed_files, $_);
+                }
+            } else {
+                if ($ignored_fails{$_}) {
+                    print "\n$_ marked as failed, but we found it anyway!\n";
+                }
+            }
+        }
+
+        if (-e $outfile && $check_checksums) {
+	    my $csum_result;
+	    $csum_result = validate_checksum($_, $outfile, "md5");
+	    if (0 == $csum_result) {
+		# no problems
+		$csum_result = validate_checksum($_, $outfile, "sha256");
+	    }
+	    if ($csum_result == -1) {
+		print "\nChecksum failure: $_\n";
+		$ck_failed++;
+		push (@ck_failed_files, $_);
+	    } elsif ($csum_result == -2) {
+                print "\nFailed to jigsum $_\n";
+            }
+	}
+
+        $done++;
+        if ( !($done % 10000) or ($check_checksums && !($done % 100))) {
+            print "$done done, ignored $ignored, failed $failed ck_failed $ck_failed out of $num_unique\n";
+        }
+    }
+    print "  Finished: $done/$num_unique, $failed failed, $ck_failed ck_failed, ignored $ignored\n\n";
+
+    if (defined($failedfile) && ($failed > 0)) {
+        print "Writing list of failed files to $failedfile\n";
+        open(FAIL_LOG, "> $failedfile") or die "Failed to open $failedfile: $!\n";
+        if ($backref_file) {
+            open (BACKREF, "> $backref_file") or die "Failed to open $backref_file: $!\n";
+        }
+        foreach my $missing (@failed_files) {
+            print FAIL_LOG "$missing\n";
+            if ($backref_file) {
+                print BACKREF "$missing:\n";
+                print BACKREF $jigdo_backref{$missing};
+            }
+        }
+        close FAIL_LOG;
+        if ($backref_file) {
+            close BACKREF;
+        }
+    }
+
+    # Now walk the tree and delete files that we no longer need
+    print "Scanning for now-redundant files\n";
+    find(\&delete_redundant, $dirname);
+    print "  Finished: $old_deleted old files removed\n";
+}
+
+# Parse jigdo_list file if we have one
+if (defined($jigdolist)) {
+    if ($verbose) {
+        print "Checking for jigdos in $jigdolist\n";
+    }
+    open (INLIST, "$jigdolist") or die "Can't open file $jigdolist: $!\n";
+    while ($_ = <INLIST>) {
+        chomp;
+        if (length($_) > 1) {
+            push (@jigdos, $_);
+        }
+    }
+    close INLIST;
+}
+$jlistdonedate = `date -u`;
+
+print "Working on $num_jigdos jigdo file(s)\n";
+# Walk through the list of jigdos, parsing as we go
+my $num_parsed = 0;
+print "Reading / parsing jigdo file(s)\n";
+
+foreach my $injig (sort @jigdos) {
+    open (INJIG, "zcat -f $injig |");
+    $num_parsed++;
+    while (<INJIG>) {
+        my ($file, $jigsum, $type);
+        chomp;
+        foreach my $keyword (@keywords) {
+            # Look for a jigdo format v1 match first, with
+            # base64(ish)-encoded md5 checksums (22 chars before the
+            # "=")
+            if (m/^(.{22})=$keyword:(.*)$/) {
+                $jigsum = $1;
+                $file = $2;
+                $file =~ s?^/??;
+                $type = "md5";
+            }
+            # Otherwise, look for a jigdo format v2 match, with
+            # base64(ish)-encoded sha256 checksums (43 chars before
+            # the "=")
+            if (m/^(.{43})=$keyword:(.*)$/) {
+                $jigsum = $1;
+                $file = $2;
+                $file =~ s?^/??;
+                $type = "sha256";
+            }
+        }
+        if (defined($file)) {
+            $num_unsorted++;
+            # Only count a ref of any kind as unique
+            if (!exists $ref{$file}) {
+                $num_unique++;
+            }
+            # Even though we have to treat different checksums
+            # differently
+            if (!exists $ref{$file}{$type}) {
+                $ref{$file}{$type} = $jigsum;
+            } else {
+                if (!($ref{$file}{$type} =~ /\Q$jigsum\E/ )) {
+                    print "  ERROR: $file referenced again with different checksum!\n";
+                    print "    (old " . $ref{$file}{$type} . " new $jigsum\n";
+                }
+            }
+            if ($backref_file) {
+                if (!defined $jigdo_backref{$file}) {
+                    $jigdo_backref{$file} = " $injig\n";
+                } else {
+                    $jigdo_backref{$file} .= " $injig\n";
+                }
+            }
+            if (!($num_unsorted % 100000) ) {
+                print "  found $num_unsorted total, $num_unique unique file refs, $num_parsed / $num_jigdos jigdo files ($injig)\n";
+            }
+        }
+    }
+    close(INJIG);
+}
+$parsedonedate = `date -u`;
+print "  found $num_unsorted total, $num_unique unique file refs in $num_jigdos jigdo files\n";
+
+if ($checksum_out) {
+    open(CK_OUT, "> $checksum_out") or die "Can't open $checksum_out for writing: $!\n";
+    foreach $_ (sort (keys %ref)) {
+        if (exists $ref{$_}{"md5"}) {
+            print CK_OUT $ref{$_}{"md5"} . "  $_\n";
+        }
+        if (exists $ref{$_}{"sha256"}) {
+            print CK_OUT $ref{$_}{"sha256"} . "  $_\n";
+        }
+    }
+    close(CK_OUT);
+}
+
+if ($num_unique < 5) {
+    die "Only $num_unique for the snapshot? Something is wrong; abort!\n"
+}
+
+# Now look at the snapshot dir
+if (! -d $dirname) {
+    print "$dirname does not exist\n";
+    if (!$dryrun) {
+        mkdirs($dirname);
+    } else {
+        die "DRYRUN: not making it, so aborting\n";
+    }
+}
+if (defined($ignorefile)) {
+    parse_ignore_file($ignorefile);
+}
+
+print "Trying to snapshot-link $num_unique files into $dirname\n";
+if ($check_checksums) {
+    print "  (and checksumming every file, so this may take a while)\n";
+}
+generate_snapshot_tree();
+$snapdonedate = `date -u`;
+
+chomp ($startdate, $jlistdonedate, $parsedonedate, $snapdonedate);
+
+print "$startdate: startup\n";
+print "$jlistdonedate: found $num_jigdos jigdo files\n";
+print "$parsedonedate: found $num_unsorted files referenced in those jigdo files, $num_unique unique\n";
+print "$snapdonedate: snapshot done\n";
+
+if ($mode eq "single") {
+    if ($dryrun) {
+        print "DRYRUN: Not creating files in $outdir\n";
+    } else {
+        my ($gzin, $gzout, $line);
+        $gzin = gzopen($single_jigdo, "rb") or
+            die "Unable to open jigdo file $single_jigdo for reading: $!\n";
+        $gzout = gzopen("$outdir/$cdname.jigdo", "wb9") or
+            die "Unable to open new jigdo file $outdir/$cdname.jigdo for writing: $!\n";
+        while ($gzin->gzreadline($line) > 0) {
+            $line =~ s:^Template=.*$:Template=$cdname.template:;
+            $gzout->gzwrite($line);
+        }
+        $gzin->close();
+        $gzout->close();
+        copy("$template", "$outdir/$cdname.template") or
+            die "Failed to copy template file $template: $!\n";
+        open (CONF, "> $outdir/$cdname.conf") or
+            die "Failed to open conf file $outdir/$cdname.conf for writing: $!\n";
+        print CONF "JIGDO=$cdname.jigdo\n";
+        print CONF "TEMPLATE=$cdname.template\n";
+        print CONF "SNAPSHOT=snapshot/$dirname\n";
+        close(CONF);
+        print "Jigdo files, config and snapshot made in $outdir\n";
+    }
+}

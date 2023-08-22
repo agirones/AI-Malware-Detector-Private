@@ -1,0 +1,13 @@
+#!/bin/bash
+
+if ! ps ux|grep "[s]ystemd --user" > /dev/null 2>&1; then
+    echo "Can't start an unprivileged container on a pure CGroups v2 host without a systemd user session running."
+    echo "If you are trying to get a non-interactive user to have unprivileged containers running, you need to"
+    echo "enable lingering sessions for that user, via loginctl enable-linger ${USER} as root."
+    exit 1
+fi
+
+export XDG_RUNTIME_DIR="/run/user/$UID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
+/usr/bin/systemd-run --user --scope -p "Delegate=yes" /usr/bin/lxc-attach "$@"

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#===============================================================================
+#
+#          FILE: remmina-file-wrapper
+#
+#         USAGE: ./remmina-file-wrapper
+#
+#   DESCRIPTION: Wrapper used by xdg to connect or edit a remmina file clicking
+#                on it, or clicking to an URL like remmina:///profile.remmina
+#
+#       OPTIONS: File path or URL
+#  REQUIREMENTS: ---
+#          BUGS: ---
+#         NOTES: ---
+#        AUTHOR: Antenore Gatta (tmow), antenore@simbiosi.org
+#  ORGANIZATION: Remmina
+#       CREATED: 15. 06. 19 00:32:11
+#      REVISION:  ---
+#       LICENSE: GPLv2
+#===============================================================================
+
+set -o nounset                                  # Treat unset variables as an error
+
+USRBIN="$(dirname "$(readlink -f "${0}")")"
+REMMINA="/usr/bin/remmina"
+
+if [[ ! -f "$REMMINA" ]] ; then
+    REMMINA="${USRBIN}/remmina"
+else
+    REMMINA="remmina"
+fi
+
+export GLADE_HOME="$USRBIN/../share/remmina/ui/"
+
+case "$@" in
+    *rdp:*)
+        "$REMMINA" "${@}"
+        ;;
+    *spice:*)
+        "$REMMINA" "${@}"
+        ;;
+    *vnc:*)
+        "$REMMINA" "${@}"
+        ;;
+    *ssh:*)
+        "$REMMINA" "${@}"
+        ;;
+    *remmina:*)
+        "$REMMINA" "${@#remmina:\/\/}"
+        ;;
+    *)
+        "$REMMINA" "${@}"
+        ;;
+esac
